@@ -1,4 +1,4 @@
-#include "../Public/stdafx.h"
+﻿#include "../Public/stdafx.h"
 
 #include <string>
 #include <sstream>
@@ -9,6 +9,7 @@
 #include <set>
 #include <array>
 #include <regex>
+#include <algorithm>
 
 #include "../Public/G1M.h"
 #include "../Public/G1T.h"
@@ -18,6 +19,104 @@
 #include "../Public/G2A.h"
 #include "../Public/G1A.h"
 #include "../Public/OBJD.h"
+
+// Build Nioh 3 meshlet triangle IB from 0x1000b/0x1000c/0x1000e/0x10010 sections.
+// Returns nullptr if meshlets not available or no triangles for this submesh.
+template<bool bBigEndian>
+BYTE* buildNioh3MeshletIB(const G1MG<bBigEndian>& g1mg, uint32_t smIdx, const G1MGIndexBuffer<bBigEndian>& ibuf,
+	uint32_t& outCount, noeRAPI_t* rapi, std::vector<void*>& unpooledBufs)
+{
+	if (g1mg.meshletTriangles.empty() || g1mg.meshletInfoOffsets.empty())
+		return nullptr;
+
+	std::vector<uint32_t> triIndices;
+	std::set<uint64_t> seenTris;
+
+	for (size_t mi = 0; mi < g1mg.meshletInfoOffsets.size(); mi++)
+	{
+		// Skip non-leaf meshlets
+		if (mi < g1mg.meshletIsLeaf.size() && !g1mg.meshletIsLeaf[mi])
+			continue;
+
+		// Check submesh mapping
+		if (mi < g1mg.meshletToSubmesh.size() && g1mg.meshletToSubmesh[mi] != smIdx)
+			continue;
+
+		uint32_t c_off = g1mg.meshletInfoOffsets[mi];
+		uint32_t c_cnt = g1mg.meshletInfoCounts[mi];
+		uint32_t u1 = g1mg.meshletInfoU1[mi];
+		uint32_t u2 = g1mg.meshletInfoU2[mi];
+
+		if (u1 + u2 > ibuf.count) continue;
+		if (c_off + c_cnt > g1mg.meshletTriangles.size()) continue;
+
+		for (uint32_t ti = 0; ti < c_cnt; ti++)
+		{
+			uint32_t packed = g1mg.meshletTriangles[c_off + ti];
+			uint32_t idx0 = packed & 0x3FF;
+			uint32_t idx1 = (packed >> 10) & 0x3FF;
+			uint32_t idx2 = (packed >> 20) & 0x3FF;
+
+			if (idx0 >= u2 || idx1 >= u2 || idx2 >= u2)
+				continue;
+
+			uint32_t g0 = 0, g1v = 0, g2v = 0;
+			if (ibuf.dataType == RPGEODATA_UINT)
+			{
+				uint32_t* ibData = (uint32_t*)ibuf.bufferAdress;
+				g0 = ibData[u1 + idx0];
+				g1v = ibData[u1 + idx1];
+				g2v = ibData[u1 + idx2];
+				if (bBigEndian)
+				{
+					LITTLE_BIG_SWAP(g0);
+					LITTLE_BIG_SWAP(g1v);
+					LITTLE_BIG_SWAP(g2v);
+				}
+			}
+			else if (ibuf.dataType == RPGEODATA_USHORT)
+			{
+				uint16_t* ibData = (uint16_t*)ibuf.bufferAdress;
+				g0 = ibData[u1 + idx0];
+				g1v = ibData[u1 + idx1];
+				g2v = ibData[u1 + idx2];
+				if (bBigEndian)
+				{
+					LITTLE_BIG_SWAP(g0);
+					LITTLE_BIG_SWAP(g1v);
+					LITTLE_BIG_SWAP(g2v);
+				}
+			}
+			else continue;
+
+			if (g0 == g1v || g1v == g2v || g0 == g2v)
+				continue;
+
+			uint32_t a = g0, b = g1v, c = g2v;
+			if (a > b) std::swap(a, b);
+			if (b > c) std::swap(b, c);
+			if (a > b) std::swap(a, b);
+			uint64_t key = ((uint64_t)a << 42) | ((uint64_t)b << 21) | (uint64_t)c;
+			if (seenTris.count(key))
+				continue;
+			seenTris.insert(key);
+
+			triIndices.push_back(g0);
+			triIndices.push_back(g1v);
+			triIndices.push_back(g2v);
+		}
+	}
+
+	if (triIndices.empty())
+		return nullptr;
+
+	size_t bufSize = sizeof(uint32_t) * triIndices.size();
+	BYTE* outBuf = (BYTE*)rapi->Noesis_UnpooledAlloc((int)bufSize);
+	unpooledBufs.push_back(outBuf);
+	memcpy(outBuf, triIndices.data(), bufSize);
+	outCount = (uint32_t)triIndices.size();
+	return outBuf;
+}
 
 #define MAX_CTRL_PTS 512 //Max number of control points, maximum value before being broken in subsets, as seen in both the NUNO sections and the vshader
 
@@ -1043,7 +1142,6 @@ noesisModel_t* ProcessModel(BYTE* fileBuffer, int bufferLen, int& numMdl, noeRAP
 			}
 		}*/
 
-
 	}
 	
 	if (bDisableNUNNodes)
@@ -1258,22 +1356,37 @@ noesisModel_t* ProcessModel(BYTE* fileBuffer, int bufferLen, int& numMdl, noeRAP
 				switch (submesh.indexBufferPrimType)
 				{
 				case 3:
-					rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE, 1);
+					if (g1mg.version >= 0x30303435)
+					{
+						uint32_t meshletCount = 0;
+						BYTE* meshletIB = buildNioh3MeshletIB<bBigEndian>(g1mg, smIdx, ibuf, meshletCount, rapi, unpooledBufs);
+						if (meshletIB)
+							rapi->rpgCommitTriangles(meshletIB, RPGEODATA_UINT, meshletCount, RPGEO_TRIANGLE, 1);
+						else
+							rapi->rpgCommitTriangles(ibuf.bufferAdress, ibuf.dataType, ibuf.count, RPGEO_TRIANGLE, 1);
+					}
+					else
+						rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE, 1);
 					break;
 				case 4:
-					rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE_STRIP, 1);
+					if (g1mg.version >= 0x30303435)
+					{
+						assert(false && "Nioh 3 triangle-strip path not yet implemented (splitStripToTriangleList available in Utils.h)");
+						rapi->rpgCommitTriangles(ibuf.bufferAdress, ibuf.dataType, ibuf.count, RPGEO_TRIANGLE_STRIP, 1);
+					}
+					else
+						rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE_STRIP, 1);
 					break;
 				default:
 					break;
 				}
-				continue;
+					continue;
 			}
 			previousVBIndex = submesh.vertexBufferIndex;
 			rapi->rpgClearBufferBinds();
 			
 			//auto& vbuf = g1mg.vertexBuffers[submesh.vertexBufferIndex];
 			auto& ibuf = g1mg.indexBuffers[submesh.indexBufferIndex];
-
 
 			//useful for cloth type1
 			BYTE* controlPointsWeightsSet1 = nullptr; //Used for "horizontal" alignment with CPs on the same line, kind of
@@ -1349,6 +1462,20 @@ noesisModel_t* ProcessModel(BYTE* fileBuffer, int bufferLen, int& numMdl, noeRAP
 							rapi->rpgBindPositionBuffer(posB, RPGEODATA_FLOAT, 12);
 						}		
 						break;
+						case EG1MGVADatatype::VADataType_UShort_x4:
+							// Nioh 3 style: POSITION stored as R16G16B16A16_UINT, decode to float using bounding box
+							if (g1mg.version >= 0x30303435 && !bIsPhysType1[smIdx] && !bIsPhysType2[smIdx])
+							{
+								BYTE* posB = (BYTE*)rapi->Noesis_UnpooledAlloc(sizeof(float) * 3 * vbuf.count);
+								unpooledBufs.push_back(posB);
+								decodeNioh3Positions<bBigEndian>(vbuf.bufferAdress + attribute.offset, posB, vbuf.count, vbuf.stride,
+									g1mg.min_x, g1mg.min_y, g1mg.min_z,
+									g1mg.max_x, g1mg.max_y, g1mg.max_z);
+								if (!bIsSkeletonOrigin)
+									transformPosF<bBigEndian>(posB, vbuf.count, 12, &rootCoords.m);
+								rapi->rpgBindPositionBuffer(posB, RPGEODATA_FLOAT, 12);
+							}
+							break;
 					default:
 						break;
 					}
@@ -1582,7 +1709,6 @@ noesisModel_t* ProcessModel(BYTE* fileBuffer, int bufferLen, int& numMdl, noeRAP
 				{
 					CPSet = joints + nunMapJointIndex[smIdx];
 				}
-
 
 				float* posB = (float*)(controlPointsWeightsSet1);
 				RichVec3 u1, u2, u3, u4, v1, v2, v3, v4;
@@ -1974,19 +2100,35 @@ noesisModel_t* ProcessModel(BYTE* fileBuffer, int bufferLen, int& numMdl, noeRAP
 				if (bIsMap)
 					rapi->rpgSetTransform(&mapMatrices[i]);
 				switch (submesh.indexBufferPrimType)
-				{
-				case 3:					
-					rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE, 1);
-					//rapi->rpgCommitTriangles(nullptr, ibuf.dataType, submesh.vertexCount, RPGEO_POINTS, 1);
-					break;
-				case 4:
-					rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE_STRIP, 1);
-					//rapi->rpgCommitTriangles(nullptr, ibuf.dataType, submesh.vertexCount, RPGEO_POINTS, 1);
-					break;
-				default:
-					break;
+					{
+					case 3:
+						if (g1mg.version >= 0x30303435)
+						{
+							uint32_t meshletCount = 0;
+							BYTE* meshletIB = buildNioh3MeshletIB<bBigEndian>(g1mg, smIdx, ibuf, meshletCount, rapi, unpooledBufs);
+							if (meshletIB)
+								rapi->rpgCommitTriangles(meshletIB, RPGEODATA_UINT, meshletCount, RPGEO_TRIANGLE, 1);
+							else
+								rapi->rpgCommitTriangles(ibuf.bufferAdress, ibuf.dataType, ibuf.count, RPGEO_TRIANGLE, 1);
+						}
+						else
+							rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE, 1);
+						//rapi->rpgCommitTriangles(nullptr, ibuf.dataType, submesh.vertexCount, RPGEO_POINTS, 1);
+						break;
+					case 4:
+						if (g1mg.version >= 0x30303435)
+						{
+							assert(false && "Nioh 3 triangle-strip path not yet implemented (splitStripToTriangleList available in Utils.h)");
+							rapi->rpgCommitTriangles(ibuf.bufferAdress, ibuf.dataType, ibuf.count, RPGEO_TRIANGLE_STRIP, 1);
+						}
+						else
+							rapi->rpgCommitTriangles(ibuf.bufferAdress + submesh.indexBufferOffset * ibuf.bitwidth, ibuf.dataType, submesh.indexCount, RPGEO_TRIANGLE_STRIP, 1);
+						//rapi->rpgCommitTriangles(nullptr, ibuf.dataType, submesh.vertexCount, RPGEO_POINTS, 1);
+						break;
+					default:
+						break;
+					}
 				}
-			}
 
 		}
 	}
@@ -2170,7 +2312,6 @@ bool NPAPI_InitLocal(void)
 	int fMHandle = g_nfn->NPAPI_Register((char*)"Map file (Little Endian)", (char*) ".objd");
 	if (fMHandle < 0)
 		return false;
-
 
 
 	//Options

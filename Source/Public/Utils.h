@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #ifndef UTILS_H
 #define UTILS_H
@@ -602,6 +602,160 @@ void createDriverIndexBuffers(mesh_t & dMesh, std::vector<RichVec3> polys, std::
 	}
 }
 
+// Decode Nioh 3 style POSITION stored as R16G16B16A16_UINT into R32G32B32_FLOAT
+// Uses the G1MG bounding box to map UNORM values to world space.
+template<bool bBigEndian>
+void decodeNioh3Positions(BYTE* srcBuffer, BYTE* dstBuffer, int vertexCount, int stride,
+	float min_x, float min_y, float min_z,
+	float max_x, float max_y, float max_z)
+{
+	float* dst = (float*)dstBuffer;
+	for (int i = 0; i < vertexCount; i++)
+	{
+		uint16_t* src = (uint16_t*)(srcBuffer + stride * i);
+		uint16_t xu = src[0];
+		uint16_t yu = src[1];
+		uint16_t zu = src[2];
+		uint16_t wu = src[3]; // ignored for position
+		if (bBigEndian)
+		{
+			LITTLE_BIG_SWAP(xu);
+			LITTLE_BIG_SWAP(yu);
+			LITTLE_BIG_SWAP(zu);
+			LITTLE_BIG_SWAP(wu);
+		}
+		dst[3 * i + 0] = min_x + (xu / 65535.0f) * (max_x - min_x);
+		dst[3 * i + 1] = min_y + (yu / 65535.0f) * (max_y - min_y);
+		dst[3 * i + 2] = min_z + (zu / 65535.0f) * (max_z - min_z);
+	}
+}
+
+// Split triangle strips at large position jumps and convert to triangle list.
+// Returns a newly allocated buffer that must be freed by the caller.
+template<bool bBigEndian>
+BYTE* splitStripToTriangleList(BYTE* indexBuffer, rpgeoDataType_e indexType, uint32_t indexCount,
+    BYTE* posBuffer, uint32_t posStride, uint32_t& outIndexCount,
+    noeRAPI_t* rapi, std::vector<void*>& unpooledBufs,
+    float jumpThreshold = 50.0f)
+{
+    // Read indices into flat list
+    std::vector<uint32_t> flat;
+    flat.reserve(indexCount);
+    if (indexType == RPGEODATA_UINT)
+    {
+        uint32_t* src = (uint32_t*)indexBuffer;
+        for (uint32_t i = 0; i < indexCount; i++)
+        {
+            uint32_t v = src[i];
+            if (bBigEndian) LITTLE_BIG_SWAP(v);
+            flat.push_back(v);
+        }
+    }
+    else if (indexType == RPGEODATA_USHORT)
+    {
+        uint16_t* src = (uint16_t*)indexBuffer;
+        for (uint32_t i = 0; i < indexCount; i++)
+        {
+            uint16_t v = src[i];
+            if (bBigEndian) LITTLE_BIG_SWAP(v);
+            flat.push_back(v);
+        }
+    }
+    else if (indexType == RPGEODATA_UBYTE)
+    {
+        uint8_t* src = (uint8_t*)indexBuffer;
+        for (uint32_t i = 0; i < indexCount; i++)
+            flat.push_back(src[i]);
+    }
+    else
+    {
+        outIndexCount = 0;
+        return nullptr;
+    }
+
+    if (flat.size() < 3)
+    {
+        outIndexCount = 0;
+        return nullptr;
+    }
+
+    // Compute distances between adjacent indices
+    auto dist = [&](uint32_t a, uint32_t b) -> float
+    {
+        float* pa = (float*)(posBuffer + posStride * a);
+        float* pb = (float*)(posBuffer + posStride * b);
+        float dx = pa[0] - pb[0];
+        float dy = pa[1] - pb[1];
+        float dz = pa[2] - pb[2];
+        return sqrtf(dx * dx + dy * dy + dz * dz);
+    };
+
+    // Find jump positions
+    std::vector<uint32_t> jumps;
+    for (uint32_t i = 0; i < flat.size() - 1; i++)
+    {
+        if (dist(flat[i], flat[i + 1]) > jumpThreshold)
+            jumps.push_back(i);
+    }
+
+    // Split into strips and convert each to triangle list
+    std::vector<uint32_t> tris;
+    uint32_t start = 0;
+    for (uint32_t j : jumps)
+    {
+        if (j - start >= 2)
+        {
+            for (uint32_t k = start; k + 2 <= j; k++)
+            {
+                if ((k - start) % 2 == 0)
+                {
+                    tris.push_back(flat[k]);
+                    tris.push_back(flat[k + 1]);
+                    tris.push_back(flat[k + 2]);
+                }
+                else
+                {
+                    tris.push_back(flat[k]);
+                    tris.push_back(flat[k + 2]);
+                    tris.push_back(flat[k + 1]);
+                }
+            }
+        }
+        start = j + 1;
+    }
+    if (flat.size() - start >= 3)
+    {
+        for (uint32_t k = start; k + 2 < flat.size(); k++)
+        {
+            if ((k - start) % 2 == 0)
+            {
+                tris.push_back(flat[k]);
+                tris.push_back(flat[k + 1]);
+                tris.push_back(flat[k + 2]);
+            }
+            else
+            {
+                tris.push_back(flat[k]);
+                tris.push_back(flat[k + 2]);
+                tris.push_back(flat[k + 1]);
+            }
+        }
+    }
+
+    if (tris.empty())
+    {
+        outIndexCount = 0;
+        return nullptr;
+    }
+
+    // Allocate output buffer
+    size_t bufSize = sizeof(uint32_t) * tris.size();
+    BYTE* outBuf = (BYTE*)rapi->Noesis_UnpooledAlloc((int)bufSize);
+    unpooledBufs.push_back(outBuf);
+    memcpy(outBuf, tris.data(), bufSize);
+    outIndexCount = (uint32_t)tris.size();
+    return outBuf;
+}
 void flip_vertically(BYTE * pixels, const size_t width, const size_t height, const size_t bytes_per_pixel)
 {
 	const size_t stride = width * bytes_per_pixel;
